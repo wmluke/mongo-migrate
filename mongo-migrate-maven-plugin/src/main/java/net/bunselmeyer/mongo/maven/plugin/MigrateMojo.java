@@ -12,9 +12,10 @@ import java.util.List;
 import java.util.Set;
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
-import com.google.common.base.Predicate;
 import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Multimaps;
 import com.google.common.collect.Sets;
@@ -52,12 +53,49 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
     @MojoParameter(description = "host of the mongo db. defaults to localhost.")
     private String host;
 
+    private enum MIGRATION_CHECK {
+        ERROR, WARNING, GOOD
+    }
+
     public void execute() throws MojoExecutionException {
 
         if (StringUtils.isBlank(host)) {
             host = "localhost";
         }
 
+        Set<Class<? extends AbstractMigration>> allMigrations = scanProjectForMigrations();
+
+        ImmutableListMultimap<MIGRATION_CHECK, MigrationPreCheckStatus> statusIndex = buildMigrationStatusIndex(allMigrations);
+
+        ImmutableList<MigrationPreCheckStatus> errors = statusIndex.get(MIGRATION_CHECK.ERROR);
+        if (!errors.isEmpty()) {
+            getLog().error("Fail: Please correct the following issues...");
+            for (MigrationPreCheckStatus error : errors) {
+                getLog().error("    " + error.migration.getName() + ": " + error.message);
+            }
+            return;
+        }
+
+        ImmutableList<MigrationPreCheckStatus> warnings = statusIndex.get(MIGRATION_CHECK.WARNING);
+        if (!warnings.isEmpty()) {
+            getLog().warn("Warnings...");
+            for (MigrationPreCheckStatus warning : warnings) {
+                getLog().warn("    " + warning.migration.getName() + ": " + warning.message);
+            }
+        }
+
+        ImmutableList<MigrationPreCheckStatus> goodMigrations = statusIndex.get(MIGRATION_CHECK.GOOD);
+
+        getLog().info("Found " + goodMigrations.size() + " migrations.");
+
+        ImmutableListMultimap<String, MigrationPreCheckStatus> index = buildIndex(goodMigrations);
+
+        for (String connectionDef : index.keySet()) {
+            runMigrations(connectionDef, Lists.newArrayList(index.get(connectionDef)));
+        }
+    }
+
+    private Set<Class<? extends AbstractMigration>> scanProjectForMigrations() throws MojoExecutionException {
         ConfigurationBuilder configuration = new ConfigurationBuilder() //
             .addUrls(Sets.newHashSet(buildOutputDirectoryUrl())) //
             .addClassLoader(buildProjectClassLoader());
@@ -69,35 +107,49 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         }
 
         Reflections reflections = new Reflections(configuration);
-        Set<Class<? extends AbstractMigration>> allMigrations = reflections.getSubTypesOf(AbstractMigration.class);
-
-        Set<Class<? extends AbstractMigration>> connectedMigrations = Sets.filter(allMigrations, new Predicate<Class<? extends AbstractMigration>>() {
-            public boolean apply(Class<? extends AbstractMigration> input) {
-                if (input == null) {
-                    return false;
-                }
-                Connection connection = input.getAnnotation(Connection.class);
-                if (connection == null || StringUtils.isBlank(connection.db()) || StringUtils.isBlank(connection.version())) {
-                    return false;
-                }
-                try {
-                    return DateTime.parse(connection.version()) != null;
-                } catch (Exception e) {
-                    return false;
-                }
-            }
-        });
-
-        getLog().info("Found " + connectedMigrations.size() + " migrations.");
-
-        ImmutableListMultimap<String, Class<? extends AbstractMigration>> index = buildIndex(connectedMigrations);
-
-        for (String connectionDef : index.keySet()) {
-            runMigrations(connectionDef, Lists.newArrayList(index.get(connectionDef)));
-        }
+        return reflections.getSubTypesOf(AbstractMigration.class);
     }
 
-    private void runMigrations(String connectionDef, List<Class<? extends AbstractMigration>> migrations) {
+    private ImmutableListMultimap<MIGRATION_CHECK, MigrationPreCheckStatus> buildMigrationStatusIndex(
+        Set<Class<? extends AbstractMigration>> allMigrations) {
+        Iterable<MigrationPreCheckStatus> migrationStatus =
+            Iterables.transform(allMigrations, new Function<Class<? extends AbstractMigration>, MigrationPreCheckStatus>() {
+                public MigrationPreCheckStatus apply(Class<? extends AbstractMigration> input) {
+                    if (input == null) {
+                        return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Failed to load migration from classloader.", input);
+                    }
+                    Connection connection = input.getAnnotation(Connection.class);
+                    if (connection == null) {
+                        return new MigrationPreCheckStatus(MIGRATION_CHECK.WARNING, "Migration does not have @Connection", input);
+                    }
+
+                    if (StringUtils.isBlank(connection.db())) {
+                        return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Empty db property in @Connection", input);
+                    }
+
+                    if (StringUtils.isBlank(connection.version())) {
+                        return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Empty version property in @Connection", input);
+                    }
+
+                    try {
+                        return DateTime.parse(connection.version()) != null ? //
+                            new MigrationPreCheckStatus(MIGRATION_CHECK.GOOD, "", input) : //
+                            new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
+                    } catch (Exception e) {
+                        new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
+                    }
+                    return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Unknown error", input);
+                }
+            });
+
+        return Multimaps.index(migrationStatus, new Function<MigrationPreCheckStatus, MIGRATION_CHECK>() {
+            public MIGRATION_CHECK apply(MigrationPreCheckStatus input) {
+                return input.status;
+            }
+        });
+    }
+
+    private void runMigrations(String connectionDef, List<MigrationPreCheckStatus> migrations) {
         List<String> split = Lists.newArrayList(Splitter.on(",").omitEmptyStrings().trimResults().split(connectionDef));
         if (split.size() != 2) {
             getLog().error("Failed to resolve @Connection annotation for these migrations:");
@@ -119,10 +171,10 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
         getLog().info("Running migrations. Host: " + dbHost + ". DB: " + db);
 
-        Collections.sort(migrations, new Comparator<Class<? extends AbstractMigration>>() {
-            public int compare(Class<? extends AbstractMigration> o1, Class<? extends AbstractMigration> o2) {
-                Connection a1 = o1.getAnnotation(Connection.class);
-                Connection a2 = o2.getAnnotation(Connection.class);
+        Collections.sort(migrations, new Comparator<MigrationPreCheckStatus>() {
+            public int compare(MigrationPreCheckStatus o1, MigrationPreCheckStatus o2) {
+                Connection a1 = o1.migration.getAnnotation(Connection.class);
+                Connection a2 = o2.migration.getAnnotation(Connection.class);
                 DateTime v1 = DateTime.parse(a1.version());
                 DateTime v2 = DateTime.parse(a2.version());
                 return v1.compareTo(v2);
@@ -133,12 +185,12 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
         Class<? extends Migration> lastMigration = null;
         try {
-            for (Class<? extends Migration> migration : migrations) {
-                lastMigration = migration;
-                Migration m = migration.newInstance();
+            for (MigrationPreCheckStatus migrationStatus : migrations) {
+                lastMigration = migrationStatus.migration;
+                Migration m = migrationStatus.migration.newInstance();
                 version = m.version();
                 m.up(mongoDB);
-                getLog().info("    " + migration.getName() + ", v" + version + " migration complete");
+                getLog().info("    " + migrationStatus.migration.getName() + ", v" + version + " migration complete");
             }
         } catch (Exception e) {
             String name = lastMigration != null ? lastMigration.getName() : "";
@@ -146,12 +198,12 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         }
     }
 
-    private ImmutableListMultimap<String, Class<? extends AbstractMigration>> buildIndex(Set<Class<? extends AbstractMigration>> migrations) {
-        return Multimaps.index(migrations, new Function<Class<? extends Migration>, String>() {
-            public String apply(Class<? extends Migration> input) {
-                Connection connection = input.getAnnotation(Connection.class);
+    private ImmutableListMultimap<String, MigrationPreCheckStatus> buildIndex(Iterable<MigrationPreCheckStatus> migrations) {
+        return Multimaps.index(migrations, new Function<MigrationPreCheckStatus, String>() {
+            public String apply(MigrationPreCheckStatus input) {
+                Connection connection = input.migration.getAnnotation(Connection.class);
                 if (connection == null) {
-                    getLog().info(input.getSimpleName() + " needs @Connection");
+                    getLog().info(input.migration.getSimpleName() + " needs @Connection");
                     return "";
                 }
                 String dbHost = StringUtils.isBlank(connection.host()) ? host : connection.host();
@@ -185,6 +237,18 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
             return outputDirectoryFile.toURI().toURL();
         } catch (MalformedURLException e) {
             throw new MojoExecutionException(e.getMessage(), e);
+        }
+    }
+
+    private static class MigrationPreCheckStatus {
+        public MIGRATION_CHECK status;
+        public String message;
+        public Class<? extends AbstractMigration> migration;
+
+        private MigrationPreCheckStatus(MIGRATION_CHECK status, String message, Class<? extends AbstractMigration> migration) {
+            this.status = status;
+            this.message = message;
+            this.migration = migration;
         }
     }
 }
