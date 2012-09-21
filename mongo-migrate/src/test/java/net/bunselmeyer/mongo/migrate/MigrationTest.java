@@ -5,14 +5,13 @@ import com.mongodb.BasicDBObject;
 import com.mongodb.DB;
 import com.mongodb.DBCollection;
 import com.mongodb.Mongo;
-import org.joda.time.DateTime;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import static junit.framework.Assert.assertEquals;
 
-public class AbstractMigrationTest {
+public class MigrationTest {
 
     private static Mongo _mongo;
     private static DB _db;
@@ -39,18 +38,14 @@ public class AbstractMigrationTest {
 
         assertEquals(3, fooCollection.find(new BasicDBObject("aa", new BasicDBObject("$exists", true))).length());
 
-        Migration migration = new Migration();
+        TestMigration migration = new TestMigration();
         migration.renameField(_db, "foo", "aa", "bb");
 
         assertEquals(0, fooCollection.find(new BasicDBObject("aa", new BasicDBObject("$exists", true))).length());
         assertEquals(3, fooCollection.find(new BasicDBObject("bb", new BasicDBObject("$exists", true))).length());
     }
 
-    private static class Migration extends AbstractMigration {
-
-        public DateTime version() {
-            return null;
-        }
+    private static class TestMigration extends Migration {
 
         public void up(DB db) {
 

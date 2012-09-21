@@ -11,8 +11,6 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import com.google.common.base.Function;
-import com.google.common.base.Joiner;
-import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.Iterables;
@@ -21,16 +19,17 @@ import com.google.common.collect.Multimaps;
 import com.google.common.collect.Sets;
 import com.mongodb.DB;
 import com.mongodb.Mongo;
+import com.mongodb.WriteConcern;
 import net.bunselmeyer.mongo.annotations.Connection;
-import net.bunselmeyer.mongo.migrate.AbstractMigration;
 import net.bunselmeyer.mongo.migrate.Migration;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.builder.ToStringBuilder;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.jfrog.jade.plugins.common.injectable.MvnInjectableMojoSupport;
+import org.jfrog.maven.annomojo.annotations.MojoExecute;
 import org.jfrog.maven.annomojo.annotations.MojoGoal;
 import org.jfrog.maven.annomojo.annotations.MojoParameter;
-import org.jfrog.maven.annomojo.annotations.MojoPhase;
 import org.jfrog.maven.annomojo.annotations.MojoRequiresDependencyCollection;
 import org.jfrog.maven.annomojo.annotations.MojoRequiresDependencyResolution;
 import org.joda.time.DateTime;
@@ -39,175 +38,173 @@ import org.reflections.util.ConfigurationBuilder;
 import org.reflections.util.FilterBuilder;
 
 /**
- *
+ * Maven mojo for running mongo migrations
+ * Usage:
+ * mvn mongo:migrate
  */
 @MojoGoal("migrate")
-@MojoPhase("process-classes")
+@MojoExecute(phase = "process-classes")
 @MojoRequiresDependencyResolution("test")
 @MojoRequiresDependencyCollection("test")
 public class MigrateMojo extends MvnInjectableMojoSupport {
 
     @MojoParameter(alias = "package", description = "Package containing migrations.")
-    private String migrationPackage;
+    private String _migrationPackage;
 
     @MojoParameter(description = "host of the mongo db. defaults to localhost.")
-    private String host;
+    private String _host;
 
-    private enum MIGRATION_CHECK {
+    protected enum MIGRATION_CHECK {
         ERROR, WARNING, GOOD
     }
 
     public void execute() throws MojoExecutionException {
 
-        if (StringUtils.isBlank(host)) {
-            host = "localhost";
+        if (StringUtils.isBlank(_host)) {
+            _host = "localhost";
         }
 
-        Set<Class<? extends AbstractMigration>> allMigrations = scanProjectForMigrations();
+        Set<Class<? extends Migration>> allMigrations = scanProjectForMigrations();
 
-        ImmutableListMultimap<MIGRATION_CHECK, MigrationPreCheckStatus> statusIndex = buildMigrationStatusIndex(allMigrations);
+        ImmutableListMultimap<MIGRATION_CHECK, MigrationDetails> statusIndex = buildStatusIndex(allMigrations);
 
-        ImmutableList<MigrationPreCheckStatus> errors = statusIndex.get(MIGRATION_CHECK.ERROR);
+        ImmutableList<MigrationDetails> errors = statusIndex.get(MIGRATION_CHECK.ERROR);
         if (!errors.isEmpty()) {
             getLog().error("Fail: Please correct the following issues...");
-            for (MigrationPreCheckStatus error : errors) {
+            for (MigrationDetails error : errors) {
                 getLog().error("    " + error.migration.getName() + ": " + error.message);
             }
             return;
         }
 
-        ImmutableList<MigrationPreCheckStatus> warnings = statusIndex.get(MIGRATION_CHECK.WARNING);
+        ImmutableList<MigrationDetails> warnings = statusIndex.get(MIGRATION_CHECK.WARNING);
         if (!warnings.isEmpty()) {
             getLog().warn("Warnings...");
-            for (MigrationPreCheckStatus warning : warnings) {
+            for (MigrationDetails warning : warnings) {
                 getLog().warn("    " + warning.migration.getName() + ": " + warning.message);
             }
         }
 
-        ImmutableList<MigrationPreCheckStatus> goodMigrations = statusIndex.get(MIGRATION_CHECK.GOOD);
+        ImmutableList<MigrationDetails> goodMigrations = statusIndex.get(MIGRATION_CHECK.GOOD);
 
         getLog().info("Found " + goodMigrations.size() + " migrations.");
 
-        ImmutableListMultimap<String, MigrationPreCheckStatus> index = buildIndex(goodMigrations);
+        ImmutableListMultimap<String, MigrationDetails> index = buildIndex(goodMigrations);
 
-        for (String connectionDef : index.keySet()) {
-            runMigrations(connectionDef, Lists.newArrayList(index.get(connectionDef)));
+        List<String> keys = Lists.newArrayList(index.keySet());
+        Collections.sort(keys);
+
+        for (String connectionDef : keys) {
+            runMigrations(Lists.newArrayList(index.get(connectionDef)));
         }
     }
 
-    private Set<Class<? extends AbstractMigration>> scanProjectForMigrations() throws MojoExecutionException {
+    private Set<Class<? extends Migration>> scanProjectForMigrations() throws MojoExecutionException {
         ConfigurationBuilder configuration = new ConfigurationBuilder() //
             .addUrls(Sets.newHashSet(buildOutputDirectoryUrl())) //
             .addClassLoader(buildProjectClassLoader());
 
-        if (StringUtils.isNotBlank(migrationPackage)) {
+        if (StringUtils.isNotBlank(_migrationPackage)) {
             FilterBuilder filterBuilder = new FilterBuilder();
-            filterBuilder.include(FilterBuilder.prefix(migrationPackage));
+            filterBuilder.include(FilterBuilder.prefix(_migrationPackage));
             configuration.filterInputsBy(filterBuilder);
         }
 
         Reflections reflections = new Reflections(configuration);
-        return reflections.getSubTypesOf(AbstractMigration.class);
+        return reflections.getSubTypesOf(Migration.class);
     }
 
-    private ImmutableListMultimap<MIGRATION_CHECK, MigrationPreCheckStatus> buildMigrationStatusIndex(
-        Set<Class<? extends AbstractMigration>> allMigrations) {
-        Iterable<MigrationPreCheckStatus> migrationStatus =
-            Iterables.transform(allMigrations, new Function<Class<? extends AbstractMigration>, MigrationPreCheckStatus>() {
-                public MigrationPreCheckStatus apply(Class<? extends AbstractMigration> input) {
-                    if (input == null) {
-                        return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Failed to load migration from classloader.", input);
-                    }
-                    Connection connection = input.getAnnotation(Connection.class);
-                    if (connection == null) {
-                        return new MigrationPreCheckStatus(MIGRATION_CHECK.WARNING, "Migration does not have @Connection", input);
-                    }
-
-                    if (StringUtils.isBlank(connection.db())) {
-                        return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Empty db property in @Connection", input);
-                    }
-
-                    if (StringUtils.isBlank(connection.version())) {
-                        return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Empty version property in @Connection", input);
-                    }
-
-                    try {
-                        return DateTime.parse(connection.version()) != null ? //
-                            new MigrationPreCheckStatus(MIGRATION_CHECK.GOOD, "", input) : //
-                            new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
-                    } catch (Exception e) {
-                        new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
-                    }
-                    return new MigrationPreCheckStatus(MIGRATION_CHECK.ERROR, "Unknown error", input);
+    protected ImmutableListMultimap<MIGRATION_CHECK, MigrationDetails> buildStatusIndex(Set<Class<? extends Migration>> allMigrations) {
+        Iterable<MigrationDetails> migrationStatus = Iterables.transform(allMigrations, new Function<Class<? extends Migration>, MigrationDetails>() {
+            public MigrationDetails apply(Class<? extends Migration> input) {
+                if (input == null) {
+                    return new MigrationDetails(MIGRATION_CHECK.ERROR, "Failed to load migration from classloader.", input);
                 }
-            });
+                Connection connection = input.getAnnotation(Connection.class);
+                if (connection == null) {
+                    return new MigrationDetails(MIGRATION_CHECK.WARNING, "Migration does not have @Connection", input);
+                }
 
-        return Multimaps.index(migrationStatus, new Function<MigrationPreCheckStatus, MIGRATION_CHECK>() {
-            public MIGRATION_CHECK apply(MigrationPreCheckStatus input) {
+                if (StringUtils.isBlank(connection.db())) {
+                    return new MigrationDetails(MIGRATION_CHECK.ERROR, "Empty db property in @Connection", input);
+                }
+
+                if (StringUtils.isBlank(connection.version())) {
+                    return new MigrationDetails(MIGRATION_CHECK.ERROR, "Empty version property in @Connection", input);
+                }
+
+                try {
+                    DateTime version = DateTime.parse(connection.version());
+                    String host = StringUtils.isNotBlank(connection.host()) ? connection.host() : _host;
+                    return version != null ? //
+                        new MigrationDetails(input, version, host, connection.db()) : //
+                        new MigrationDetails(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
+                } catch (Exception e) {
+                    return new MigrationDetails(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
+                }
+            }
+        });
+
+        return Multimaps.index(migrationStatus, new Function<MigrationDetails, MIGRATION_CHECK>() {
+            public MIGRATION_CHECK apply(MigrationDetails input) {
                 return input.status;
             }
         });
     }
 
-    private void runMigrations(String connectionDef, List<MigrationPreCheckStatus> migrations) {
-        List<String> split = Lists.newArrayList(Splitter.on(",").omitEmptyStrings().trimResults().split(connectionDef));
-        if (split.size() != 2) {
-            getLog().error("Failed to resolve @Connection annotation for these migrations:");
-            getLog().error(Joiner.on("\n  ").skipNulls().join(migrations));
-            return;
-        }
-
-        String dbHost = split.get(0);
-        String db = split.get(1);
-        Mongo mongo = null;
-        try {
-            mongo = new Mongo(dbHost);
-        } catch (UnknownHostException e) {
-            getLog().error("Failed to connect to " + dbHost);
-            return;
-        }
-
-        DB mongoDB = mongo.getDB(db);
-
-        getLog().info("Running migrations. Host: " + dbHost + ". DB: " + db);
-
-        Collections.sort(migrations, new Comparator<MigrationPreCheckStatus>() {
-            public int compare(MigrationPreCheckStatus o1, MigrationPreCheckStatus o2) {
-                Connection a1 = o1.migration.getAnnotation(Connection.class);
-                Connection a2 = o2.migration.getAnnotation(Connection.class);
-                DateTime v1 = DateTime.parse(a1.version());
-                DateTime v2 = DateTime.parse(a2.version());
-                return v1.compareTo(v2);
+    protected ImmutableListMultimap<String, MigrationDetails> buildIndex(Iterable<MigrationDetails> migrations) {
+        return Multimaps.index(migrations, new Function<MigrationDetails, String>() {
+            public String apply(MigrationDetails input) {
+                return input.host + "," + input.db;
             }
         });
+    }
 
-        DateTime version;
+    private void runMigrations(List<MigrationDetails> migrations) {
+        if (migrations.isEmpty()) {
+            return;
+        }
+
+        MigrationDetails migrationDetails = migrations.get(0);
+
+        Mongo mongo;
+        try {
+            mongo = new Mongo(migrationDetails.host);
+        } catch (UnknownHostException e) {
+            getLog().error("Failed to connect to " + migrationDetails.host);
+            return;
+        }
+
+        mongo.setWriteConcern(WriteConcern.SAFE);
+
+        DB db = mongo.getDB(migrationDetails.db);
+
+        getLog().info("Running migrations. Host: " + migrationDetails.host + ". DB: " + migrationDetails.db);
+
+        sortMigrationDetails(migrations);
 
         Class<? extends Migration> lastMigration = null;
         try {
-            for (MigrationPreCheckStatus migrationStatus : migrations) {
+            for (MigrationDetails migrationStatus : migrations) {
                 lastMigration = migrationStatus.migration;
                 Migration m = migrationStatus.migration.newInstance();
-                version = m.version();
-                m.up(mongoDB);
-                getLog().info("    " + migrationStatus.migration.getName() + ", v" + version + " migration complete");
+                m.up(db);
+                getLog().info("    " + migrationStatus.migration.getName() + ", v" + migrationStatus.version + " migration complete");
             }
         } catch (Exception e) {
             String name = lastMigration != null ? lastMigration.getName() : "";
             getLog().info("    FAIL! " + name + " migration error", e);
+        } finally {
+            mongo.close();
         }
     }
 
-    private ImmutableListMultimap<String, MigrationPreCheckStatus> buildIndex(Iterable<MigrationPreCheckStatus> migrations) {
-        return Multimaps.index(migrations, new Function<MigrationPreCheckStatus, String>() {
-            public String apply(MigrationPreCheckStatus input) {
-                Connection connection = input.migration.getAnnotation(Connection.class);
-                if (connection == null) {
-                    getLog().info(input.migration.getSimpleName() + " needs @Connection");
-                    return "";
-                }
-                String dbHost = StringUtils.isBlank(connection.host()) ? host : connection.host();
-                return dbHost + "," + connection.db();
+    protected void sortMigrationDetails(List<MigrationDetails> migrations) {
+        Collections.sort(migrations, new Comparator<MigrationDetails>() {
+            public int compare(MigrationDetails o1, MigrationDetails o2) {
+                DateTime v1 = o1.version;
+                DateTime v2 = o2.version;
+                return v1.compareTo(v2);
             }
         });
     }
@@ -240,15 +237,38 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         }
     }
 
-    private static class MigrationPreCheckStatus {
+    protected static class MigrationDetails {
         public MIGRATION_CHECK status;
         public String message;
-        public Class<? extends AbstractMigration> migration;
+        public Class<? extends Migration> migration;
+        public DateTime version;
+        public String host;
+        public String db;
 
-        private MigrationPreCheckStatus(MIGRATION_CHECK status, String message, Class<? extends AbstractMigration> migration) {
+        private MigrationDetails(MIGRATION_CHECK status, String message, Class<? extends Migration> migration) {
             this.status = status;
             this.message = message;
             this.migration = migration;
+        }
+
+        protected MigrationDetails(Class<? extends Migration> migration, DateTime version, String host, String db) {
+            this.status = MIGRATION_CHECK.GOOD;
+            this.migration = migration;
+            this.version = version;
+            this.host = host;
+            this.db = db;
+        }
+
+        @Override
+        public String toString() {
+            return new ToStringBuilder(null).
+                append("status", status).
+                append("message", message).
+                append("migration", migration != null ? migration.getSimpleName() : null).
+                append("version", version).
+                append("host", host).
+                append("db", db).
+                toString();
         }
     }
 }

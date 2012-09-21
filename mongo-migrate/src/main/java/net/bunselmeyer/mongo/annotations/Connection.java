@@ -12,5 +12,5 @@ public @interface Connection {
 
     String db();
 
-    String version() default "";
+    String version();
 }
