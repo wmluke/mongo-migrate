@@ -18,14 +18,18 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Multimaps;
 import com.google.common.collect.Sets;
 import com.mongodb.DB;
+import com.mongodb.DBCollection;
 import com.mongodb.Mongo;
 import com.mongodb.WriteConcern;
 import net.bunselmeyer.mongo.annotations.Connection;
 import net.bunselmeyer.mongo.migrate.Migration;
+import net.vz.mongodb.jackson.JacksonDBCollection;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.builder.ToStringBuilder;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.plugin.MojoExecutionException;
+import org.bson.types.ObjectId;
+import org.codehaus.jackson.map.ObjectMapper;
 import org.jfrog.jade.plugins.common.injectable.MvnInjectableMojoSupport;
 import org.jfrog.maven.annomojo.annotations.MojoExecute;
 import org.jfrog.maven.annomojo.annotations.MojoGoal;
@@ -33,6 +37,7 @@ import org.jfrog.maven.annomojo.annotations.MojoParameter;
 import org.jfrog.maven.annomojo.annotations.MojoRequiresDependencyCollection;
 import org.jfrog.maven.annomojo.annotations.MojoRequiresDependencyResolution;
 import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
 import org.reflections.Reflections;
 import org.reflections.util.ConfigurationBuilder;
 import org.reflections.util.FilterBuilder;
@@ -53,6 +58,7 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
     @MojoParameter(description = "host of the mongo db. defaults to localhost.")
     private String _host;
+    private final ObjectMapper _objectMapper = new ObjectMapper();
 
     protected enum MIGRATION_CHECK {
         ERROR, WARNING, GOOD
@@ -179,17 +185,31 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
         DB db = mongo.getDB(migrationDetails.db);
 
+        JacksonDBCollection<MigrationVersionDetails, ObjectId> migrationVersionCollection = createMigrationVersionCollection(db);
+
         getLog().info("Running migrations. Host: " + migrationDetails.host + ". DB: " + migrationDetails.db);
 
         sortMigrationDetails(migrations);
 
         Class<? extends Migration> lastMigration = null;
         try {
-            for (MigrationDetails migrationStatus : migrations) {
-                lastMigration = migrationStatus.migration;
-                Migration m = migrationStatus.migration.newInstance();
-                m.up(db);
-                getLog().info("    " + migrationStatus.migration.getName() + ", v" + migrationStatus.version + " migration complete");
+            for (MigrationDetails details : migrations) {
+                lastMigration = details.migration;
+                Migration m = details.migration.newInstance();
+
+                MigrationVersionDetails versionDetails = new MigrationVersionDetails();
+                versionDetails.setMigrationName(details.migration.getName());
+                versionDetails.setVersion(details.version);
+
+                if (migrationVersionCollection.getCount(versionDetails) == 0) {
+                    m.up(db);
+                    db.getLastError().throwOnError();
+                    getLog().info("    " + details.migration.getName() + ", v" + details.version + " migration complete");
+                    versionDetails.setRun(DateTime.now(DateTimeZone.UTC));
+                    migrationVersionCollection.insert(versionDetails);
+                } else {
+                    getLog().info("    " + details.migration.getName() + ", v" + details.version + " was already run");
+                }
             }
         } catch (Exception e) {
             String name = lastMigration != null ? lastMigration.getName() : "";
@@ -197,6 +217,11 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         } finally {
             mongo.close();
         }
+    }
+
+    private JacksonDBCollection<MigrationVersionDetails, ObjectId> createMigrationVersionCollection(DB db) {
+        DBCollection dbCollection = db.getCollection(MigrationVersionDetails.class.getSimpleName());
+        return JacksonDBCollection.wrap(dbCollection, MigrationVersionDetails.class, ObjectId.class, _objectMapper);
     }
 
     protected void sortMigrationDetails(List<MigrationDetails> migrations) {
