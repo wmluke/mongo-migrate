@@ -12,7 +12,7 @@ Commandline:
 ```
 $ git clone https://github.com/wmluke/mongo-migrate.git
 $ cd mongo-migrate
-$ cd mvn install
+$ mvn install
 ```
 
 Project POM:
@@ -27,6 +27,7 @@ Project POM:
             <artifactId>mongo-migrate</artifactId>
             <version>0.1-SNAPSHOT</version>
         </dependency>
+        ...
     </dependencies>
 
     <build>
@@ -38,15 +39,26 @@ Project POM:
                 <version>0.1-SNAPSHOT</version>
                 <configuration>
                     <!-- Package to find Migrations -->
-                    <package>net.bunselmeyer.mongo.migrate.migrations</package>
+                    <package>com.foo.migrations</package>
                 </configuration>
             </plugin>
+            ...
         </plugins>
     </build>
 </project>
 ```
 
 ## Java Usage
+
+### @Connection
+* host: (Optional) Mongo DB host. Defaults to "localhost"
+* db: Mongo database name.
+* version: Migration version as an ISO timestamp.
+
+### Migration
+Abstract class used to define migrations.
+
+### Example
 
 ```java
 @Connection(db = "blog", version = "2012-09-11T00:14:00-0800")
@@ -67,7 +79,16 @@ public class RenameUserEmailFieldMigration extends Migration {
 ## Maven Goals
 
 ### mongo:migrate
-Migrate a mongo DB upwards.
+Migrate a mongo DB upwards.  This goal will create a collection called MigrationVersionDetails that contains...
+
+```json
+{
+    "_id": ObjectId( "505d6c18c2202768f668d4eb" ),
+    "version" : 1347351240000,
+    "migrationName" : "com.foo.migrations.RenameUserEmailFieldMigration",
+    "run" : 1348299800474
+}
+```
 
 ```
 $ mvn mongo:migrate
