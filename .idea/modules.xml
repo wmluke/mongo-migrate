@@ -2,8 +2,8 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/mongo-migrate-maven-plugin/mongo-maven-plugin.iml" filepath="$PROJECT_DIR$/mongo-migrate-maven-plugin/mongo-maven-plugin.iml" />
       <module fileurl="file://$PROJECT_DIR$/mongo-migrate/mongo-migrate.iml" filepath="$PROJECT_DIR$/mongo-migrate/mongo-migrate.iml" />
-      <module fileurl="file://$PROJECT_DIR$/mongo-migrate-maven-plugin/mongo-migrate-maven-plugin.iml" filepath="$PROJECT_DIR$/mongo-migrate-maven-plugin/mongo-migrate-maven-plugin.iml" />
       <module fileurl="file://$PROJECT_DIR$/mongo-migrate-parent.iml" filepath="$PROJECT_DIR$/mongo-migrate-parent.iml" />
     </modules>
   </component>
