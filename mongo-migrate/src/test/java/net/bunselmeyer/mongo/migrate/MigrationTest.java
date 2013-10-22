@@ -34,7 +34,7 @@ public class MigrationTest {
 
     @BeforeClass
     public static void setUpClass() throws UnknownHostException {
-        _mongo = new Mongo("localhost");
+        _mongo = new Mongo("localhost", 17017);
         _db = _mongo.getDB("unittest_db");
     }
 

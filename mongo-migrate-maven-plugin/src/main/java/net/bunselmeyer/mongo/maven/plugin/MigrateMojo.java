@@ -16,23 +16,8 @@
 
 package net.bunselmeyer.mongo.maven.plugin;
 
-import java.io.File;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.net.URLClassLoader;
-import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Set;
 import com.google.common.base.Function;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableListMultimap;
-import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Multimaps;
-import com.google.common.collect.Sets;
+import com.google.common.collect.*;
 import com.mongodb.DB;
 import com.mongodb.DBCollection;
 import com.mongodb.Mongo;
@@ -43,37 +28,51 @@ import net.vz.mongodb.jackson.JacksonDBCollection;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.builder.ToStringBuilder;
 import org.apache.maven.artifact.Artifact;
+import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugins.annotations.LifecyclePhase;
+import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.plugins.annotations.ResolutionScope;
+import org.apache.maven.project.MavenProject;
 import org.bson.types.ObjectId;
 import org.codehaus.jackson.map.ObjectMapper;
-import org.jfrog.jade.plugins.common.injectable.MvnInjectableMojoSupport;
-import org.jfrog.maven.annomojo.annotations.MojoExecute;
-import org.jfrog.maven.annomojo.annotations.MojoGoal;
-import org.jfrog.maven.annomojo.annotations.MojoParameter;
-import org.jfrog.maven.annomojo.annotations.MojoRequiresDependencyCollection;
-import org.jfrog.maven.annomojo.annotations.MojoRequiresDependencyResolution;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
 import org.reflections.Reflections;
 import org.reflections.util.ConfigurationBuilder;
 import org.reflections.util.FilterBuilder;
 
+import java.io.File;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.net.UnknownHostException;
+import java.util.*;
+
 /**
  * Maven mojo for running mongo migrations
  * Usage:
  * mvn mongo:migrate
  */
-@MojoGoal("migrate")
-@MojoExecute(phase = "process-classes")
-@MojoRequiresDependencyResolution("test")
-@MojoRequiresDependencyCollection("test")
-public class MigrateMojo extends MvnInjectableMojoSupport {
+@Mojo(
+        name = "migrate",
+        defaultPhase = LifecyclePhase.PROCESS_CLASSES,
+        requiresDependencyResolution = ResolutionScope.TEST,
+        requiresDependencyCollection = ResolutionScope.TEST
+)
+public class MigrateMojo extends AbstractMojo {
 
-    @MojoParameter(alias = "package", description = "Package containing migrations.")
-    private String _migrationPackage;
+    @Parameter(alias = "package", required = true)
+    private String migrationPackage;
 
-    @MojoParameter(description = "host of the mongo db. defaults to localhost.")
-    private String _host;
+    @Parameter(alias = "host")
+    private String host;
+
+    @Parameter(alias = "port", defaultValue = "27017")
+    private String port;
+
+
     private final ObjectMapper _objectMapper = new ObjectMapper();
 
     protected enum MIGRATION_CHECK {
@@ -82,8 +81,8 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
     public void execute() throws MojoExecutionException {
 
-        if (StringUtils.isBlank(_host)) {
-            _host = "localhost";
+        if (StringUtils.isBlank(host)) {
+            host = "localhost";
         }
 
         Set<Class<? extends Migration>> allMigrations = scanProjectForMigrations();
@@ -123,12 +122,12 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
     private Set<Class<? extends Migration>> scanProjectForMigrations() throws MojoExecutionException {
         ConfigurationBuilder configuration = new ConfigurationBuilder() //
-            .addUrls(Sets.newHashSet(buildOutputDirectoryUrl())) //
-            .addClassLoader(buildProjectClassLoader());
+                .addUrls(Sets.newHashSet(buildOutputDirectoryUrl())) //
+                .addClassLoader(buildProjectClassLoader());
 
-        if (StringUtils.isNotBlank(_migrationPackage)) {
+        if (StringUtils.isNotBlank(migrationPackage)) {
             FilterBuilder filterBuilder = new FilterBuilder();
-            filterBuilder.include(FilterBuilder.prefix(_migrationPackage));
+            filterBuilder.include(FilterBuilder.prefix(migrationPackage));
             configuration.filterInputsBy(filterBuilder);
         }
 
@@ -157,10 +156,10 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
                 try {
                     DateTime version = DateTime.parse(connection.version());
-                    String host = StringUtils.isNotBlank(connection.host()) ? connection.host() : _host;
+                    String host = StringUtils.isNotBlank(connection.host()) ? connection.host() : MigrateMojo.this.host;
                     return version != null ? //
-                        new MigrationDetails(input, version, host, connection.db()) : //
-                        new MigrationDetails(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
+                            new MigrationDetails(input, version, host, connection.db()) : //
+                            new MigrationDetails(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
                 } catch (Exception e) {
                     return new MigrationDetails(MIGRATION_CHECK.ERROR, "Failed to parse @version to timestamp in @Connection", input);
                 }
@@ -191,9 +190,12 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
 
         Mongo mongo;
         try {
-            mongo = new Mongo(migrationDetails.host);
+            mongo = new Mongo(migrationDetails.host, Integer.parseInt(port));
         } catch (UnknownHostException e) {
-            getLog().error("Failed to connect to " + migrationDetails.host);
+            getLog().error("Failed to connect to " + migrationDetails.host + ":" + port);
+            return;
+        } catch (NumberFormatException e) {
+            getLog().error("Invalid port: " + port);
             return;
         }
 
@@ -254,6 +256,7 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         getLog().debug("adding all artifacts to classLoader");
         List<URL> urls = new ArrayList<URL>();
 
+
         for (Object artifact : getProject().getArtifacts()) {
             try {
                 urls.add(((Artifact) artifact).getFile().toURI().toURL());
@@ -276,6 +279,10 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         } catch (MalformedURLException e) {
             throw new MojoExecutionException(e.getMessage(), e);
         }
+    }
+
+    private MavenProject getProject() {
+        return (MavenProject) getPluginContext().get("project");
     }
 
     protected static class MigrationDetails {
@@ -303,13 +310,13 @@ public class MigrateMojo extends MvnInjectableMojoSupport {
         @Override
         public String toString() {
             return new ToStringBuilder(null).
-                append("status", status).
-                append("message", message).
-                append("migration", migration != null ? migration.getSimpleName() : null).
-                append("version", version).
-                append("host", host).
-                append("db", db).
-                toString();
+                    append("status", status).
+                    append("message", message).
+                    append("migration", migration != null ? migration.getSimpleName() : null).
+                    append("version", version).
+                    append("host", host).
+                    append("db", db).
+                    toString();
         }
     }
 }
